@@ -1,106 +1,137 @@
-import os
 import streamlit as st
-from pypdf import PdfReader
+import fitz
+import re
 from groq import Groq
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-st.set_page_config(page_title="PDF RAG Assistant", page_icon="📄", layout="centered")
+st.set_page_config(page_title="PDF RAG Assistant", page_icon="📄")
 
 st.title("📄 PDF RAG Assistant")
 st.write("Upload a PDF and ask questions about its contents.")
 
-# Get Groq API key from Streamlit Secrets
+# Get the Groq key from Streamlit Secrets
 try:
-    api_key = st.secrets["GROQ_API_KEY"]
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except Exception:
-    api_key = os.getenv("GROQ_API_KEY")
+    GROQ_API_KEY = ""
 
-if not api_key:
-    st.error("Groq API key is not configured. Add GROQ_API_KEY to Streamlit Secrets.")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY is missing. Add it under Manage app → Secrets.")
     st.stop()
 
-client = Groq(api_key=api_key)
-
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-embedding_model = load_embedding_model()
+client = Groq(api_key=GROQ_API_KEY)
 
 
-def extract_text(pdf_file):
-    reader = PdfReader(pdf_file)
+def clean_text(text):
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_pdf_text(uploaded_file):
+    data = uploaded_file.getvalue()
+    pdf = fitz.open(stream=data, filetype="pdf")
+
     pages = []
 
-    for page in reader.pages:
-        text = page.extract_text()
+    for page_number, page in enumerate(pdf, start=1):
+        text = clean_text(page.get_text("text"))
+
         if text:
-            pages.append(text)
+            pages.append({
+                "page": page_number,
+                "text": text
+            })
 
-    return "\n".join(pages)
+    pdf.close()
+    return pages
 
 
-def split_text(text, chunk_size=800, overlap=150):
-    words = text.split()
+def create_chunks(pages, chunk_size=1800, overlap=300):
     chunks = []
 
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
+    for page in pages:
+        text = page["text"]
+        start = 0
 
-        if chunk.strip():
-            chunks.append(chunk)
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            piece = text[start:end].strip()
 
-        start += chunk_size - overlap
+            if piece:
+                chunks.append({
+                    "page": page["page"],
+                    "text": piece
+                })
+
+            if end >= len(text):
+                break
+
+            start = end - overlap
 
     return chunks
 
 
-def create_index(chunks):
-    embeddings = embedding_model.encode(
-        chunks,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+def retrieve_chunks(question, chunks, k=6):
+    documents = [x["text"] for x in chunks]
+
+    try:
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2)
+        )
+
+        matrix = vectorizer.fit_transform(documents)
+        question_vector = vectorizer.transform([question])
+        scores = cosine_similarity(question_vector, matrix).flatten()
+
+        ranked = scores.argsort()[::-1]
+
+        selected = [
+            chunks[i]
+            for i in ranked[:k]
+            if scores[i] > 0
+        ]
+
+        # Prevent a useful PDF from returning "not found" just because
+        # the wording of the question differs from the PDF wording.
+        if not selected:
+            selected = chunks[:min(k, len(chunks))]
+
+        return selected
+
+    except ValueError:
+        return chunks[:min(k, len(chunks))]
+
+
+def ask_groq(question, chunks):
+    context = "\n\n---\n\n".join(
+        f"[Page {item['page']}]\n{item['text']}"
+        for item in chunks
     )
 
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings.astype("float32"))
+    prompt = f"""
+You are a PDF question answering assistant.
 
-    return index
+Answer the question using the PDF context below.
 
+Rules:
+- Give a direct and useful answer.
+- Use the PDF as the main source.
+- Do not invent facts.
+- If the answer is supported by the context, answer it even if the
+  wording of the question is different from the wording in the PDF.
+- If useful, mention the relevant page number.
+- Only say the information is unavailable when the context genuinely
+  does not contain enough information.
 
-def retrieve_chunks(question, chunks, index, k=4):
-    question_embedding = embedding_model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-
-    scores, indices = index.search(
-        question_embedding.astype("float32"),
-        min(k, len(chunks))
-    )
-
-    return [chunks[i] for i in indices[0] if i >= 0]
-
-
-def ask_groq(question, context):
-    prompt = f"""You are a helpful PDF question-answering assistant.
-
-Answer the user's question using only the information provided in the context below.
-
-If the answer cannot be found in the context, say:
-"I could not find that information in the uploaded PDF."
-
-Do not make up information.
-
-Context:
+PDF CONTEXT:
 {context}
 
-Question:
+QUESTION:
 {question}
 """
 
@@ -109,50 +140,57 @@ Question:
         messages=[
             {
                 "role": "system",
-                "content": "You answer questions from retrieved PDF context accurately and concisely."
+                "content": "Answer questions about the uploaded PDF accurately and clearly."
             },
             {
                 "role": "user",
                 "content": prompt
             }
         ],
-        temperature=0.2,
+        max_completion_tokens=1200,
+        include_reasoning=False
     )
 
-    return response.choices[0].message.content
+    return response.choices[0].message.content.strip()
 
 
-uploaded_file = st.file_uploader(
-    "Upload your PDF",
-    type=["pdf"]
-)
+if "file_name" not in st.session_state:
+    st.session_state.file_name = None
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
+uploaded_file = st.file_uploader("Upload your PDF", type=["pdf"])
 
 if uploaded_file:
-    if (
-        "file_name" not in st.session_state
-        or st.session_state.file_name != uploaded_file.name
-    ):
-        with st.spinner("Processing PDF..."):
-            text = extract_text(uploaded_file)
 
-            if not text.strip():
-                st.error("Could not extract text from this PDF.")
+    if uploaded_file.name != st.session_state.file_name:
+
+        with st.spinner("Reading and indexing the PDF..."):
+            pages = extract_pdf_text(uploaded_file)
+
+            if not pages:
+                st.error(
+                    "No readable text was found in this PDF. "
+                    "If it is a scanned/image-only PDF, OCR is required."
+                )
                 st.stop()
 
-            chunks = split_text(text)
-            index = create_index(chunks)
+            chunks = create_chunks(pages)
 
             st.session_state.file_name = uploaded_file.name
             st.session_state.chunks = chunks
-            st.session_state.index = index
             st.session_state.messages = []
 
-        st.success(f"PDF processed successfully — {len(chunks)} chunks created.")
+        st.success(
+            f"PDF ready — {len(pages)} pages and {len(chunks)} chunks indexed."
+        )
 
     st.divider()
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -170,19 +208,23 @@ if uploaded_file:
 
         with st.chat_message("assistant"):
             with st.spinner("Searching the PDF..."):
-                retrieved = retrieve_chunks(
-                    question,
-                    st.session_state.chunks,
-                    st.session_state.index
-                )
+                try:
+                    relevant_chunks = retrieve_chunks(
+                        question,
+                        st.session_state.chunks
+                    )
 
-                context = "\n\n---\n\n".join(retrieved)
-                answer = ask_groq(question, context)
+                    answer = ask_groq(question, relevant_chunks)
+                    st.markdown(answer)
 
-            st.markdown(answer)
+                except Exception as error:
+                    answer = "Something went wrong while generating the answer."
+                    st.error(answer)
+                    st.caption(f"Technical details: {error}")
 
         st.session_state.messages.append(
             {"role": "assistant", "content": answer}
         )
+
 else:
     st.info("Upload a PDF to get started.")
